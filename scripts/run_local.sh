@@ -26,7 +26,7 @@ echo "==> [3/5] 维表拉链（2026-10-31 初始快照 / 2026-11-02 改名换片
 "${PY}" --master "local[2]" "${ROOT}/jobs/dim_stg_load.py" --conf "${PIPELINE_CONF}" --snapshot-date 2026-11-02
 "${PY}" --master "local[2]" "${ROOT}/jobs/dim_scd2_job.py" --conf "${PIPELINE_CONF}" --snapshot-date 2026-11-02
 
-echo "==> [4/5] 事件接入与明细（含乱序/重复/多次异常/迟到补数）"
+echo "==> [4/5] 事件接入与明细（含乱序/重复/多次异常/迟到补数/运单拆合关系）"
 "${PY}" --master "local[2]" "${ROOT}/jobs/ods_load.py" --conf "${PIPELINE_CONF}" --biz-date 2026-11-01
 "${PY}" --master "local[2]" "${ROOT}/jobs/dwd_detail_job.py" --conf "${PIPELINE_CONF}" --biz-date 2026-11-01
 "${PY}" --master "local[2]" "${ROOT}/jobs/ods_load.py" --conf "${PIPELINE_CONF}" --biz-date 2026-11-02
@@ -44,6 +44,10 @@ echo "==> [4/5] 事件接入与明细（含乱序/重复/多次异常/迟到补�
 "${PY}" --master "local[2]" "${ROOT}/jobs/backfill_job.py" --conf "${PIPELINE_CONF}" \
     --scope WAYBILL --waybill-nos WB006 --switch
 "${PY}" --master "local[2]" "${ROOT}/jobs/dq_check_job.py" --conf "${PIPELINE_CONF}" --biz-date 2026-11-02
+
+# 运单拆合关系接入（11-02 建合票/分票/重派关系；11-04 WB013 关系事后修正）
+"${PY}" --master "local[2]" "${ROOT}/jobs/waybill_relation_job.py" --conf "${PIPELINE_CONF}" --biz-date 2026-11-02
+"${PY}" --master "local[2]" "${ROOT}/jobs/waybill_relation_job.py" --conf "${PIPELINE_CONF}" --biz-date 2026-11-04
 
 # 旧宽表逆透视迁移冒烟（独立单号，含幂等重跑）
 "${PY}" --master "local[2]" "${ROOT}/tests/smoke_legacy_migration.py" --conf "${PIPELINE_CONF}"

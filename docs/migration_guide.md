@@ -56,8 +56,9 @@
 ## 4. 切换到每日增量（双跑对账期）
 
 1. 部署 Airflow DAG `ltl_daily_incremental`（`orchestration/dags/`）。
-   执行链：`ods_load ∥ dim_stg_load → scd2_preview → scd2_apply → dwd_detail → dq_check`。
+   执行链：`ods_load ∥ dim_stg_load → scd2_preview → scd2_apply → dwd_detail → waybill_relation → dq_check`。
 2. 增量按事件时间水位线 `meta.watermark_log` 每日推进；失败不写 SUCCESS、不推进水位。
+   关系接入写独立的 `layer='RELATION'` 水位，与 ODS/DWD 互不影响。
 3. 旧报表临时双跑：旧宽表口径 vs `app.v_waybill_wide_compat`，按天对账。
 - **验证点**：连续 N 天双跑口径一致（差异仅来自宽表已知缺陷：末次异常、最新名称）。
 - **回滚点 R3**：DAG 可随时暂停，回退到旧宽表；新表数据保留不删。
@@ -99,7 +100,49 @@ spark-submit jobs/backfill_job.py --scope DATE_RANGE \
 3. **历史不回刷**：`event_date < 快照日` 的事实永远关联旧版本，去年报表数字不变；
    组织调整只在新日期分区生效。
 
-## 8. Schema 演进规则（强制）
+## 8. 运单拆合关系（合票/分票/退件重派）治理
+
+拆合之后轨迹分散在多条运单上，关系域由两张表承载（`sql/09_waybill_relation.sql`）：
+
+| 表 | 性质 | 职责 |
+|---|---|---|
+| `dwd.waybill_relation_event_log` | APPEND-ONLY 台账 | 每条关系变更指令追加一行，永不更新/删除 |
+| `dwd.waybill_relation` | 关系拉链 SCD2 | 物化父子/兄弟关系，带 `[eff_time,exp_time)`、`is_current`、分摊规则与比例 |
+
+**铁律：关系变更不得改写已生成的事件。** 关系作业只写上述两张关系表，
+全程不 touch `dwd.waybill_event_detail`；关系修正 = 闭合旧版本 + 插入
+`change_seq+1` 新版本，历史版本物理保留。
+
+1. 关系变更报文落地到 `${landing.relation.dir}/biz_date=<date>/*.jsonl`，
+   枚举 `relation_type ∈ {MERGE,SPLIT,RESEND_REASSIGN,PARENT_CHILD,SIBLING}`、
+   `alloc_rule ∈ {WEIGHT,VOLUME,EQUAL,NONE}`。
+2. 接入（每日 DAG 的 `waybill_relation` 任务，亦可手动补跑）：
+   ```bash
+   spark-submit jobs/waybill_relation_job.py --biz-date 2026-11-02
+   # 强制重放某些关系（补数）
+   spark-submit jobs/waybill_relation_job.py --biz-date 2026-11-04 \
+       --rebuild-relations REL013
+   ```
+   - 台账按 `(event_id, source_file)` MERGE，文件级幂等。
+   - 拉链按 `relation_id` 整体重放：删该关系旧版本 + 插重算版本，其它关系不动。
+3. **历史查询按查询时点可用的关系快照展开**：
+   `WHERE <as_of> >= eff_time AND <as_of> < exp_time`。修正后旧时点查询结果可复现。
+4. **一票货完整轨迹**：`app.v_waybill_full_track` 沿 `group_no` 展开成员运单事件，
+   成员先按 `(group_no, waybill_no)` 唯一化、事件按 `(group_no, event_id)` 去重，
+   跨多条运单也不重复计数（测试 `test_16`）。
+5. **合票时效按主运单**：`app.v_waybill_merge_timeliness` 的关键时点全部取
+   MERGE 主运单（parent）自身事件，成员运单不单独计时（测试 `test_17`）。
+6. **分票干线分摊规则**（测试 `test_18`）：
+   - 分摊对象仅干线节点 `DEPART/ARRIVE/TRANSFER`，末端 `DELIVER/SIGN` 不分摊；
+   - `WEIGHT/VOLUME`：`alloc_ratio = 本单权重 / 同 parent 同期兄弟权重和`；
+   - `EQUAL`：`alloc_ratio = 1 / 兄弟数`；同 parent 子单 ratio 之和恒为 1；
+   - 子单分摊段时长 = 主运单干线段时长 × `alloc_ratio`，分摊量之和=原始段时长；
+   - 比例在版本生效时点的兄弟集合内归一化并随版本冻结，修正权重只影响新版本。
+- **回滚点 R6**：关系表与事件表物理解耦。关系接错时重放修正关系即可（事件零改动）；
+  如需整体撤销，可用 Iceberg 快照分别回滚 `waybill_relation` 与
+  `waybill_relation_event_log`，不影响事件明细与既有报表。
+
+## 9. Schema 演进规则（强制）
 
 - 只加列、不改类型、不删列；加列与历史回填由 `jobs/schema_evolution_job.py` 统一完成
   （Iceberg 1.8 的 Hadoop/Derby 环境不依赖 SQL 列 DEFAULT）：
@@ -109,7 +152,7 @@ spark-submit jobs/backfill_job.py --scope DATE_RANGE \
 - 新作业节点（如明年 `STATION_IN`）只是 `event_type` 新枚举，**无需加时间列**。
 - 下游视图只做明细层投影，上游加列不影响既有报表（测试 `test_12` 固化此约束）。
 
-## 9. 数据质量与运维
+## 10. 数据质量与运维
 
 - 每日 `dq_check_job.py` 写 `meta.dq_daily_result`，覆盖：
   事件缺失率、乱序率、重复率、维表未匹配率（四张维表分别评价）、分区产出时延；
@@ -118,7 +161,7 @@ spark-submit jobs/backfill_job.py --scope DATE_RANGE \
 - Iceberg 定期维护：`expire_snapshots`（保留 30 天，与补数窗口对齐）、
   `rewrite_data_files` 压实小文件。
 
-## 10. 回滚点汇总
+## 11. 回滚点汇总
 
 | 回滚点 | 阶段 | 回滚动作 |
 |---|---|---|
@@ -128,3 +171,4 @@ spark-submit jobs/backfill_job.py --scope DATE_RANGE \
 | R3 | 双跑期 | 暂停 DAG，连接串指回旧宽表 |
 | R4 | 视图切换 | 指回保留的物理旧宽表 |
 | R5 | 补数/回刷 | Iceberg 快照回滚 或 backup 表换名 |
+| R6 | 拆合关系 | 重放修正关系（事件零改动）；关系表按 Iceberg 快照独立回滚 |

@@ -16,6 +16,9 @@ from pyspark.sql import SparkSession
 # ---- 全仓库统一表名（与 sql/*.sql 完全一致）----
 ODS_EVENT = "ltl.ods.waybill_event_raw"
 DWD_EVENT = "ltl.dwd.waybill_event_detail"
+# 运单拆合关系域：关系变更事件台账（APPEND-ONLY）+ 关系拉链（SCD2 快照）
+RELATION_LOG = "ltl.dwd.waybill_relation_event_log"
+RELATION = "ltl.dwd.waybill_relation"
 STG_TABLES = {
     "hub": "ltl.dim_stg.hub_stg",
     "courier": "ltl.dim_stg.courier_stg",
@@ -63,6 +66,13 @@ BACKFILL_LOG = "ltl.meta.backfill_job_log"
 
 UNMATCHED_SK = -1
 FUTURE_DATE = "9999-12-31"
+# 关系拉链当前版本的失效时间哨兵（9999-12-31 23:59:59 之前均视为有效）
+FUTURE_TS = "9999-12-31 00:00:00"
+# 运单关系类型与分摊规则枚举
+RELATION_TYPES = ["MERGE", "SPLIT", "RESEND_REASSIGN", "PARENT_CHILD", "SIBLING"]
+ALLOC_RULES = ["WEIGHT", "VOLUME", "EQUAL", "NONE"]
+# 参与分票干线分摊的事件类型（干线节点），末端派送/签收不分摊
+LINE_HAUL_EVENT_TYPES = ["DEPART", "ARRIVE", "TRANSFER"]
 EVENT_TYPES = ["PICKUP", "DEPART", "ARRIVE", "TRANSFER",
                "DELIVER", "SIGN", "REJECT", "EXCEPTION", "POD"]
 

@@ -1,4 +1,5 @@
-"""每日增量 DAG：ODS 接入 -> 维表快照落地 -> SCD2 拉链 -> DWD 明细 -> DQ 日检。
+"""每日增量 DAG：ODS 接入 -> 维表快照落地 -> SCD2 拉链 -> DWD 明细
+-> 运单拆合关系接入 -> DQ 日检。
 
 调度时间：每日 02:17（错峰），业务日期取前一天（data_interval_start 对齐 T-1）。
 补数与全量回刷走独立 DAG ltl_backfill，不与本 DAG 混用。
@@ -59,6 +60,12 @@ with DAG(
         task_id="dwd_detail",
         bash_command=spark_submit("dwd_detail_job.py", "--biz-date", biz),
     )
+    # 运单拆合关系接入：只新增关系记录、不改写事件，独立于 DWD 重放；
+    # 放在明细之后，保证一票货轨迹/时效/分摊视图查询时关系已就绪
+    relation_load = BashOperator(
+        task_id="waybill_relation",
+        bash_command=spark_submit("waybill_relation_job.py", "--biz-date", biz),
+    )
     dq_check = BashOperator(
         task_id="dq_check",
         bash_command=spark_submit("dq_check_job.py", "--biz-date", biz),
@@ -68,4 +75,4 @@ with DAG(
     # ODS 与维表落地互不依赖可并行；拉链必须在 DWD 代理键解析前完成
     start >> [ods_load, dim_stg_load]
     dim_stg_load >> scd2_preview >> scd2_apply
-    [ods_load, scd2_apply] >> dwd_detail >> dq_check >> end
+    [ods_load, scd2_apply] >> dwd_detail >> relation_load >> dq_check >> end

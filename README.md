@@ -27,10 +27,13 @@ sql/                         四层建表与视图（Spark 3.5 SQL + Iceberg 1.8
   06_app_views.sql           应用层视图（含旧宽表兼容视图、压货、绩效、投诉归因）
   07_evolution.sql           Schema 演进规则参考（实际由作业幂等执行）
   08_legacy_source.sql       旧宽表迁移源登记
+  09_waybill_relation.sql    运单拆合关系：关系变更台账(APPEND-ONLY)+关系拉链(SCD2)
+  10_relation_views.sql      一票货轨迹展开/合票主单时效/分票干线分摊视图
 jobs/                        PySpark 作业
   ddl_init.py                一键建仓（幂等）
   ods_load.py                原始接入（原样保存、文件级幂等）
   dwd_detail_job.py          去重/乱序排序/重放/代理键解析
+  waybill_relation_job.py    合票/分票/退件重派关系接入（只增关系不改事件、分摊归一化）
   dim_stg_load.py            维表快照落地
   dim_scd2_job.py            SCD2 拉链（--preview 出重算影响预览）
   backfill_job.py            补数（影子表+前后对比+受控切换/回滚）
@@ -42,8 +45,8 @@ docker/                      Dockerfile + entrypoint
 docker-compose.yml           一键启动 Airflow+Spark
 conf/pipeline.conf           全局配置（catalog、阈值、目录）
 scripts/run_local.sh         本地无 Docker 一键验证
-tests/                       夹具生成、13 项端到端断言、旧宽表迁移冒烟
-docs/migration_guide.md      迁移步骤、执行顺序与回滚点（R0–R5）
+tests/                       夹具生成、19 项端到端断言、旧宽表迁移冒烟
+docs/migration_guide.md      迁移步骤、执行顺序与回滚点（R0–R6）
 ```
 
 ## 3. 技术栈与 Catalog
@@ -96,8 +99,8 @@ bash scripts/run_local.sh
 ```
 
 该脚本会：生成夹具 → 建仓 → 两期维表拉链 → 四天事件增量 → DQ →
-11-05 迟到事件补数 → 跑 `pytest`。结束打印 `ALL LOCAL STEPS DONE` 与
-`13 passed` 即通过。
+11-05 迟到事件补数 → 运单拆合关系接入（含 11-04 关系事后修正）→ 跑 `pytest`。
+结束打印 `ALL LOCAL STEPS DONE` 与 `19 passed` 即通过。
 
 也可单步执行（均为幂等）：
 
@@ -111,7 +114,7 @@ $SPARK_HOME/bin/spark-submit --master local[2] jobs/backfill_job.py        --con
 
 ## 6. 验证方式与覆盖点
 
-`tests/test_pipeline.py` 的 13 项断言（已在本地 Spark+Iceberg 实际执行通过）覆盖：
+`tests/test_pipeline.py` 的 19 项断言（已在本地 Spark+Iceberg 实际执行通过）覆盖：
 
 1. ODS 原样保存重复上报与原始报文，不清洗不合并；
 2. DWD 按 `event_id` 去重；
@@ -125,7 +128,13 @@ $SPARK_HOME/bin/spark-submit --master local[2] jobs/backfill_job.py        --con
 10. 补数只动受影响运单，台账含分区清单/前后对比/差异，对比文件落盘；
 11. 水位线按 ODS/DWD 分层按日推进；
 12. Schema 只加列+回填，既有视图与报表不受影响、加列幂等；
-13. 旧宽表兼容视图一行一运单、关键时间列与新列正确透视。
+13. 旧宽表兼容视图一行一运单、关键时间列与新列正确透视；
+14. 关系台账只增不改，关系修正以"闭旧版本+新版本"表达，历史版本物理保留；
+15. 历史查询按查询时点可用的关系快照展开，修正后旧时点结果仍可复现；
+16. 一票货完整轨迹沿关系展开，跨运单按 `event_id` 去重、不重复计数（含兄弟边）；
+17. 合票时效只按主运单计算，成员运单不单独计时；
+18. 分票干线节点按 WEIGHT/EQUAL 规则分摊到子单，比例之和=1、分摊量之和=原始段时长；
+19. 关系变更不改写已生成事件：被移出关系的运单事件原样保留，关系表不含事件字段。
 
 另有 `tests/smoke_legacy_migration.py` 验证旧宽表逆透视迁移与重跑幂等。
 
@@ -142,4 +151,28 @@ $SPARK_HOME/bin/spark-submit --master local[2] jobs/backfill_job.py        --con
   调整只在快照日新分区生效。
 - **质量阈值**：`conf/pipeline.conf` 中 `dq.threshold.*`。
 
-迁移的完整执行顺序与回滚点见 **[docs/migration_guide.md](docs/migration_guide.md)**（R0–R5）。
+## 8. 运单拆合关系（合票/分票/退件重派）
+
+业务存在合票、分票、退件重派、主副与兄弟运单关系，拆合后轨迹分散在多条运单上。
+本仓库用**独立的关系域**承载，与事件明细物理解耦（`sql/09_waybill_relation.sql`、
+`sql/10_relation_views.sql`、`jobs/waybill_relation_job.py`）：
+
+- **两张关系表**：`dwd.waybill_relation_event_log`（变更台账，APPEND-ONLY，永不改删）
+  与 `dwd.waybill_relation`（关系拉链，带 `[eff_time,exp_time)`、`is_current`、
+  分摊规则 `alloc_rule` 与归一化比例 `alloc_ratio`）。
+- **只增关系，不改事件**：关系作业只写两张关系表，绝不回写/删除
+  `waybill_event_detail`。关系修正 = 闭合旧版本 + 插入 `change_seq+1` 新版本，
+  历史版本物理保留（测试 14、19）。
+- **历史按快照展开**：查询时点 `as_of` 用 `as_of >= eff_time AND as_of < exp_time`
+  取当时可用的关系版本，修正后旧时点查询结果仍可复现（测试 15）。
+- **一票货完整轨迹**：同票货共享 `group_no`，`app.v_waybill_full_track` 沿组展开
+  成员运单事件；成员按 `(group_no, waybill_no)` 唯一化、事件按 `(group_no, event_id)`
+  去重，跨多条运单也不重复计数（测试 16）。
+- **合票时效按主运单**：`app.v_waybill_merge_timeliness` 关键时点全部取 MERGE
+  主运单自身事件，成员运单不单独计时（测试 17）。
+- **分票干线分摊规则**：仅干线节点 `DEPART/ARRIVE/TRANSFER` 参与；
+  `WEIGHT/VOLUME` 按本单权重占兄弟权重和、`EQUAL` 按 1/兄弟数归一化，
+  同 parent 子单 `alloc_ratio` 之和恒为 1；子单分摊段时长 = 主运单段时长 × 比例，
+  分摊量之和 = 原始段时长。比例随关系版本冻结，修正只影响新版本（测试 18）。
+
+迁移的完整执行顺序与回滚点见 **[docs/migration_guide.md](docs/migration_guide.md)**（R0–R6）。
